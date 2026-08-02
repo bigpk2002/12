@@ -1,6 +1,7 @@
 """
 Daily XAU/USD (Gold) trading report generator.
-Pipeline: Twelve Data (price data) -> Gemini (analysis, free tier) -> LINE Messaging API (delivery)
+Pipeline: Twelve Data (historical candles, may be delayed) + goldprice.dev (live spot price)
+          -> Gemini (analysis, free tier) -> LINE Messaging API (delivery)
 
 Run manually:  python3 report.py
 Run on schedule: see README.md for cron / GitHub Actions setup
@@ -28,7 +29,7 @@ TIMEFRAMES = [
 
 
 def fetch_candles(interval: str, outputsize: int) -> list[dict]:
-    """Fetch OHLC candles for XAU/USD from Twelve Data."""
+    """Fetch OHLC candles for XAU/USD from Twelve Data (delayed on free tier)."""
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": SYMBOL,
@@ -44,6 +45,29 @@ def fetch_candles(interval: str, outputsize: int) -> list[dict]:
     return list(reversed(data["values"]))
 
 
+def fetch_live_price() -> dict | None:
+    """Fetch near-real-time XAU/USD spot price from goldprice.dev (free, no key needed).
+    Returns None if unavailable so the report still works without it."""
+    try:
+        resp = requests.get(
+            "https://api.goldprice.dev/v1/prices",
+            params={"symbol": "XAU-USD-SPOT"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        row = data["symbols"][0]
+        return {
+            "price": row.get("price"),
+            "bid": row.get("bid"),
+            "ask": row.get("ask"),
+            "computed_at": row.get("computed_at"),
+            "is_stale": row.get("is_stale"),
+        }
+    except Exception:
+        return None
+
+
 def candles_to_compact_text(candles: list[dict]) -> str:
     """Turn candle list into a compact CSV-like block to keep the prompt small."""
     lines = ["datetime,open,high,low,close"]
@@ -52,11 +76,21 @@ def candles_to_compact_text(candles: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def build_prompt(market_data_blocks: dict[str, str]) -> str:
+def build_prompt(market_data_blocks: dict[str, str], live_price: dict | None) -> str:
     sections = []
     for label, block in market_data_blocks.items():
         sections.append(f"### {label}\n{block}")
     joined = "\n\n".join(sections)
+
+    if live_price and live_price.get("price"):
+        live_note = (
+            f"\nราคาล่าสุดแบบเรียลไทม์ (จาก goldprice.dev, ณ {live_price.get('computed_at')}): "
+            f"{live_price.get('price')} USD (bid {live_price.get('bid')} / ask {live_price.get('ask')})\n"
+            "หมายเหตุ: ข้อมูลแท่งเทียนด้านล่างจาก Twelve Data แผนฟรีอาจดีเลย์ได้หลายชั่วโมง "
+            "ให้ใช้ราคาเรียลไทม์นี้เป็นราคาอ้างอิงปัจจุบัน แต่ใช้แท่งเทียนด้านล่างวิเคราะห์โครงสร้าง/เทรนด์"
+        )
+    else:
+        live_note = "\n(ไม่มีข้อมูลราคาเรียลไทม์ในรอบนี้ ให้ใช้ราคาปิดล่าสุดในแท่งเทียนแทน)"
 
     return f"""คุณคือนักวิเคราะห์เทคนิคทองคำ (XAU/USD) ให้วิเคราะห์ข้อมูลราคาย้อนหลังหลาย timeframe ด้านล่าง
 แล้วสรุปเป็นรายงานสั้น กระชับ อ่านเร็วบนมือถือ ใช้หัวข้อดังนี้เป๊ะๆ:
@@ -64,13 +98,14 @@ def build_prompt(market_data_blocks: dict[str, str]) -> str:
 1. เทรนด์แต่ละ timeframe (4H/1H/15M) - ขึ้น/ลง/แกว่ง
 2. โครงสร้างกราฟสำคัญ (higher high/low หรือ lower high/low ล่าสุด)
 3. แนวรับ-แนวต้านสำคัญ (ระบุตัวเลขราคาโดยประมาณจากข้อมูลที่ให้)
-4. แผนวันนี้: เงื่อนไข buy และเงื่อนไข sell แยกกัน (ถ้าราคาทำอะไรถึงจะเข้า)
+4. แผนวันนี้: เงื่อนไข buy และเงื่อนไข sell แยกกัน (ถ้าราคาทำอะไรถึงจะเข้า) — เทียบกับราคาเรียลไทม์ปัจจุบันด้วยถ้ามี
 5. ข้อควรระวัง (ข่าวสำคัญ/ความผันผวน) ถ้าประเมินจากข้อมูลไม่ได้ให้บอกว่าไม่มีข้อมูลข่าว
 
 ห้ามฟันธงว่าราคาจะไปทางไหนแน่นอน ให้เขียนเป็นเงื่อนไข (ถ้า...แล้ว...) เท่านั้น
 ปิดท้ายด้วยประโยคเตือนสั้นๆ ว่านี่คือการวิเคราะห์ทางเทคนิคอัตโนมัติ ไม่ใช่คำแนะนำการลงทุน ผู้ใช้ต้องตัดสินใจและบริหารความเสี่ยงเอง
+{live_note}
 
-ข้อมูลราคา:
+ข้อมูลราคาย้อนหลัง (อาจดีเลย์):
 
 {joined}
 """
@@ -141,11 +176,17 @@ def main():
         candles = fetch_candles(tf["interval"], tf["outputsize"])
         market_blocks[tf["label"]] = candles_to_compact_text(candles)
 
+    print("Fetching live spot price...")
+    live_price = fetch_live_price()
+
     print("Building prompt and calling Gemini...")
-    prompt = build_prompt(market_blocks)
+    prompt = build_prompt(market_blocks, live_price)
     report = call_gemini(prompt)
 
-    header = f"📊 รายงานทอง XAU/USD - {datetime.now().strftime('%d/%m/%Y %H:%M')}\n\n"
+    header = f"📊 รายงานทอง XAU/USD - {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
+    if live_price and live_price.get("price"):
+        header += f"💰 ราคาสดตอนนี้: {live_price['price']} USD\n"
+    header += "\n"
     full_message = header + report
 
     print("Sending to LINE...")
