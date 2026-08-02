@@ -122,15 +122,24 @@ def call_gemini(prompt: str) -> str:
         headers={"Content-Type": "application/json"},
         json={
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"maxOutputTokens": 1200},
+            "generationConfig": {"maxOutputTokens": 4096},
         },
         timeout=60,
     )
     resp.raise_for_status()
     data = resp.json()
     try:
-        parts = data["candidates"][0]["content"]["parts"]
-        return "".join(p.get("text", "") for p in parts).strip()
+        candidate = data["candidates"][0]
+        parts = candidate.get("content", {}).get("parts", [])
+        text = "".join(p.get("text", "") for p in parts).strip()
+        if not text:
+            raise RuntimeError(
+                f"Gemini returned no visible text (finishReason={candidate.get('finishReason')}). "
+                f"Full response: {data}"
+            )
+        if candidate.get("finishReason") == "MAX_TOKENS":
+            text += "\n\n⚠️ (รายงานอาจถูกตัดตอนเพราะโทเค็นไม่พอ)"
+        return text
     except (KeyError, IndexError):
         raise RuntimeError(f"Unexpected Gemini response: {data}")
 
