@@ -1,0 +1,157 @@
+"""
+Daily XAU/USD (Gold) trading report generator.
+Pipeline: Twelve Data (price data) -> Gemini (analysis, free tier) -> LINE Messaging API (delivery)
+
+Run manually:  python3 report.py
+Run on schedule: see README.md for cron / GitHub Actions setup
+"""
+
+import os
+import sys
+import requests
+from datetime import datetime
+
+# ---- Config (set these as environment variables, see .env.example) ----
+TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_USER_ID = os.environ.get("LINE_USER_ID")
+
+GEMINI_MODEL = "gemini-2.5-flash"  # free tier model
+
+SYMBOL = "XAU/USD"
+TIMEFRAMES = [
+    {"interval": "4h", "outputsize": 60, "label": "4H (เทรนด์หลัก)"},
+    {"interval": "1h", "outputsize": 60, "label": "1H (โครงสร้างกราฟ)"},
+    {"interval": "15min", "outputsize": 60, "label": "15M (จุดเข้า)"},
+]
+
+
+def fetch_candles(interval: str, outputsize: int) -> list[dict]:
+    """Fetch OHLC candles for XAU/USD from Twelve Data."""
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": SYMBOL,
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": TWELVE_DATA_API_KEY,
+    }
+    resp = requests.get(url, params=params, timeout=20)
+    data = resp.json()
+    if "values" not in data:
+        raise RuntimeError(f"Twelve Data error for {interval}: {data}")
+    # API returns newest first; reverse to chronological order
+    return list(reversed(data["values"]))
+
+
+def candles_to_compact_text(candles: list[dict]) -> str:
+    """Turn candle list into a compact CSV-like block to keep the prompt small."""
+    lines = ["datetime,open,high,low,close"]
+    for c in candles:
+        lines.append(f"{c['datetime']},{c['open']},{c['high']},{c['low']},{c['close']}")
+    return "\n".join(lines)
+
+
+def build_prompt(market_data_blocks: dict[str, str]) -> str:
+    sections = []
+    for label, block in market_data_blocks.items():
+        sections.append(f"### {label}\n{block}")
+    joined = "\n\n".join(sections)
+
+    return f"""คุณคือนักวิเคราะห์เทคนิคทองคำ (XAU/USD) ให้วิเคราะห์ข้อมูลราคาย้อนหลังหลาย timeframe ด้านล่าง
+แล้วสรุปเป็นรายงานสั้น กระชับ อ่านเร็วบนมือถือ ใช้หัวข้อดังนี้เป๊ะๆ:
+
+1. เทรนด์แต่ละ timeframe (4H/1H/15M) - ขึ้น/ลง/แกว่ง
+2. โครงสร้างกราฟสำคัญ (higher high/low หรือ lower high/low ล่าสุด)
+3. แนวรับ-แนวต้านสำคัญ (ระบุตัวเลขราคาโดยประมาณจากข้อมูลที่ให้)
+4. แผนวันนี้: เงื่อนไข buy และเงื่อนไข sell แยกกัน (ถ้าราคาทำอะไรถึงจะเข้า)
+5. ข้อควรระวัง (ข่าวสำคัญ/ความผันผวน) ถ้าประเมินจากข้อมูลไม่ได้ให้บอกว่าไม่มีข้อมูลข่าว
+
+ห้ามฟันธงว่าราคาจะไปทางไหนแน่นอน ให้เขียนเป็นเงื่อนไข (ถ้า...แล้ว...) เท่านั้น
+ปิดท้ายด้วยประโยคเตือนสั้นๆ ว่านี่คือการวิเคราะห์ทางเทคนิคอัตโนมัติ ไม่ใช่คำแนะนำการลงทุน ผู้ใช้ต้องตัดสินใจและบริหารความเสี่ยงเอง
+
+ข้อมูลราคา:
+
+{joined}
+"""
+
+
+def call_gemini(prompt: str) -> str:
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_MODEL}:generateContent"
+    )
+    resp = requests.post(
+        url,
+        params={"key": GEMINI_API_KEY},
+        headers={"Content-Type": "application/json"},
+        json={
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"maxOutputTokens": 1200},
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    try:
+        parts = data["candidates"][0]["content"]["parts"]
+        return "".join(p.get("text", "") for p in parts).strip()
+    except (KeyError, IndexError):
+        raise RuntimeError(f"Unexpected Gemini response: {data}")
+
+
+def send_to_line(message: str) -> None:
+    # LINE Messaging API push message limit is ~5000 chars per message
+    message = message[:4900]
+    resp = requests.post(
+        "https://api.line.me/v2/bot/message/push",
+        headers={
+            "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "to": LINE_USER_ID,
+            "messages": [{"type": "text", "text": message}],
+        },
+        timeout=20,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"LINE push failed ({resp.status_code}): {resp.text}")
+
+
+def main():
+    missing = [
+        name
+        for name, val in [
+            ("TWELVE_DATA_API_KEY", TWELVE_DATA_API_KEY),
+            ("GEMINI_API_KEY", GEMINI_API_KEY),
+            ("LINE_CHANNEL_ACCESS_TOKEN", LINE_CHANNEL_ACCESS_TOKEN),
+            ("LINE_USER_ID", LINE_USER_ID),
+        ]
+        if not val
+    ]
+    if missing:
+        print(f"Missing environment variables: {', '.join(missing)}", file=sys.stderr)
+        print("See .env.example and README.md for setup instructions.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"[{datetime.now()}] Fetching XAU/USD data...")
+    market_blocks = {}
+    for tf in TIMEFRAMES:
+        candles = fetch_candles(tf["interval"], tf["outputsize"])
+        market_blocks[tf["label"]] = candles_to_compact_text(candles)
+
+    print("Building prompt and calling Gemini...")
+    prompt = build_prompt(market_blocks)
+    report = call_gemini(prompt)
+
+    header = f"📊 รายงานทอง XAU/USD - {datetime.now().strftime('%d/%m/%Y %H:%M')}\n\n"
+    full_message = header + report
+
+    print("Sending to LINE...")
+    send_to_line(full_message)
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
