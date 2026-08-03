@@ -8,6 +8,7 @@ Run on schedule: see README.md for cron / GitHub Actions setup
 """
 
 import os
+import re
 import sys
 import requests
 from datetime import datetime
@@ -148,9 +149,63 @@ def call_gemini(prompt: str) -> str:
         raise RuntimeError(f"Unexpected Gemini response: {data}")
 
 
-def send_to_line(message: str) -> None:
-    # LINE Messaging API push message limit is ~5000 chars per message
-    message = message[:4900]
+def _clean_line(line: str) -> str:
+    """Strip markdown artifacts (**bold**, leading ###, leading list markers) Gemini tends to add,
+    since Flex text doesn't render markdown and would show the raw symbols otherwise."""
+    line = line.strip()
+    line = line.lstrip("#").strip()
+    line = re.sub(r"\*\*(.*?)\*\*", r"\1", line)  # **bold** -> bold
+    line = re.sub(r"^\*\s+", "• ", line)  # markdown bullet "* " -> "• "
+    line = line.replace("*", "")  # drop any remaining stray asterisks
+    return line.strip()
+
+
+def build_flex_contents(header_lines: list[str], report_text: str) -> dict:
+    """Build a LINE Flex Message bubble that highlights key lines:
+    - section headers -> bold, larger, orange, no underline
+    - any line mentioning TP / SL / Entry / แนวรับ / แนวต้าน / ราคาสด -> bold + underline + highlight color
+      (checked as "contains any", not "first match wins", since Gemini often puts Entry/SL/TP on one line)
+    - the closing disclaimer -> italic, grey
+    """
+    contents = []
+
+    for line in header_lines:
+        contents.append(
+            {"type": "text", "text": line, "weight": "bold", "size": "lg", "color": "#1DB446", "wrap": True}
+        )
+    contents.append({"type": "separator", "margin": "md"})
+
+    section_header_re = re.compile(r"^(#{1,3}\s*)?\d+\.\s")
+    highlight_re = re.compile(
+        r"\bTP\b|\bSL\b|\bEntry\b|take profit|stop loss|แนวรับ|แนวต้าน|ราคาสด|ราคาเรียลไทม์",
+        re.IGNORECASE,
+    )
+
+    for raw_line in report_text.split("\n"):
+        line = _clean_line(raw_line)
+        if not line:
+            continue
+
+        node = {"type": "text", "text": line, "wrap": True, "size": "sm", "margin": "sm"}
+
+        if section_header_re.match(raw_line.strip()) or raw_line.strip().startswith("###"):
+            node.update({"weight": "bold", "size": "md", "color": "#FF6B00", "margin": "lg"})
+        elif "ไม่ใช่คำแนะนำการลงทุน" in line or line.startswith("⚠️"):
+            node.update({"style": "italic", "size": "xs", "color": "#888888"})
+        elif highlight_re.search(line):
+            node.update({"weight": "bold", "color": "#D6336C", "decoration": "underline"})
+
+        contents.append(node)
+
+    return {
+        "type": "bubble",
+        "body": {"type": "box", "layout": "vertical", "spacing": "xs", "contents": contents},
+    }
+
+
+def send_to_line(header_lines: list[str], report_text: str) -> None:
+    bubble = build_flex_contents(header_lines, report_text)
+    alt_text = (header_lines[0] if header_lines else "รายงานทอง XAU/USD")[:400]
     resp = requests.post(
         "https://api.line.me/v2/bot/message/push",
         headers={
@@ -159,7 +214,7 @@ def send_to_line(message: str) -> None:
         },
         json={
             "to": LINE_USER_ID,
-            "messages": [{"type": "text", "text": message}],
+            "messages": [{"type": "flex", "altText": alt_text, "contents": bubble}],
         },
         timeout=20,
     )
@@ -196,14 +251,12 @@ def main():
     prompt = build_prompt(market_blocks, live_price)
     report = call_gemini(prompt)
 
-    header = f"📊 รายงานทอง XAU/USD - {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
+    header_lines = [f"📊 รายงานทอง XAU/USD - {datetime.now().strftime('%d/%m/%Y %H:%M')}"]
     if live_price and live_price.get("price"):
-        header += f"💰 ราคาสดตอนนี้: {live_price['price']} USD\n"
-    header += "\n"
-    full_message = header + report
+        header_lines.append(f"💰 ราคาสดตอนนี้: {live_price['price']} USD")
 
     print("Sending to LINE...")
-    send_to_line(full_message)
+    send_to_line(header_lines, report)
     print("Done.")
 
 
