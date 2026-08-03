@@ -183,6 +183,11 @@ def build_flex_contents(header_lines: list[str], report_text: str) -> dict:
     )
 
     for raw_line in report_text.split("\n"):
+        stripped_raw = raw_line.strip()
+        if stripped_raw and set(stripped_raw) <= {"-", "_", "*"} and len(stripped_raw) >= 3:
+            contents.append({"type": "separator", "margin": "lg", "color": "#333333"})
+            continue
+
         line = _clean_line(raw_line)
         if not line:
             continue
