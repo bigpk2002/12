@@ -161,19 +161,20 @@ def _clean_line(line: str) -> str:
 
 
 def build_flex_contents(header_lines: list[str], report_text: str) -> dict:
-    """Build a LINE Flex Message bubble that highlights key lines:
-    - section headers -> bold, larger, orange, no underline
-    - any line mentioning TP / SL / Entry / แนวรับ / แนวต้าน / ราคาสด -> bold + underline + highlight color
-      (checked as "contains any", not "first match wins", since Gemini often puts Entry/SL/TP on one line)
-    - the closing disclaimer -> italic, grey
+    """Build a LINE Flex Message bubble with a black background:
+    - all text is white for readability on black
+    - section headers -> bold, slightly larger, extra space above
+    - any line mentioning TP / SL / Entry / แนวรับ / แนวต้าน / ราคาสด -> bold + underline
+    - the closing disclaimer -> italic, muted grey
+    - generous spacing throughout so it's easy to read on a phone
     """
     contents = []
 
     for line in header_lines:
         contents.append(
-            {"type": "text", "text": line, "weight": "bold", "size": "lg", "color": "#1DB446", "wrap": True}
+            {"type": "text", "text": line, "weight": "bold", "size": "lg", "color": "#FFFFFF", "wrap": True, "margin": "md"}
         )
-    contents.append({"type": "separator", "margin": "md"})
+    contents.append({"type": "separator", "margin": "lg", "color": "#333333"})
 
     section_header_re = re.compile(r"^(#{1,3}\s*)?\d+\.\s")
     highlight_re = re.compile(
@@ -186,20 +187,27 @@ def build_flex_contents(header_lines: list[str], report_text: str) -> dict:
         if not line:
             continue
 
-        node = {"type": "text", "text": line, "wrap": True, "size": "sm", "margin": "sm"}
+        node = {"type": "text", "text": line, "wrap": True, "size": "sm", "margin": "md", "color": "#FFFFFF"}
 
         if section_header_re.match(raw_line.strip()) or raw_line.strip().startswith("###"):
-            node.update({"weight": "bold", "size": "md", "color": "#FF6B00", "margin": "lg"})
+            node.update({"weight": "bold", "size": "md", "margin": "xl"})
         elif "ไม่ใช่คำแนะนำการลงทุน" in line or line.startswith("⚠️"):
-            node.update({"style": "italic", "size": "xs", "color": "#888888"})
+            node.update({"style": "italic", "size": "xs", "color": "#AAAAAA", "margin": "xl"})
         elif highlight_re.search(line):
-            node.update({"weight": "bold", "color": "#D6336C", "decoration": "underline"})
+            node.update({"weight": "bold", "decoration": "underline"})
 
         contents.append(node)
 
     return {
         "type": "bubble",
-        "body": {"type": "box", "layout": "vertical", "spacing": "xs", "contents": contents},
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "md",
+            "backgroundColor": "#000000",
+            "paddingAll": "xl",
+            "contents": contents,
+        },
     }
 
 
